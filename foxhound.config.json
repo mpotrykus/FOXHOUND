@@ -1,0 +1,9 @@
+{
+    "logFolder": "logs",
+    "defaultTimeoutMs": 30000,
+    "defaultRetryCount": 0,
+    "retryDelayMs": 200,
+    "defaultWait": false,
+    "defaultContinueOnError": false,
+    "dryRun": false
+}

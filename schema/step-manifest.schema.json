@@ -1,0 +1,36 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "FOXHOUND Step Manifest",
+    "type": "object",
+    "required": ["name", "version", "steps"],
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Name of the pipeline/project"
+        },
+        "version": {
+            "type": "string",
+            "description": "Version of the manifest"
+        },
+        "steps": {
+            "type": "array",
+            "description": "Array of steps",
+            "items": {
+                "type": "object",
+                "required": ["id", "script"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "script": { "type": "string" },
+                    "wait": { "type": "boolean", "default": false },
+                    "timeoutMs": { "type": "integer", "minimum": 0 },
+                    "retryCount": { "type": "integer", "minimum": 0, "default": 0 },
+                    "retryDelayMs": { "type": "integer", "minimum": 0, "default": 200 },
+                    "condition": { "type": "string", "default": "true" },
+                    "continueOnError": { "type": "boolean", "default": false }
+                },
+                "additionalProperties": false
+            }
+        }
+    },
+    "additionalProperties": false
+}
