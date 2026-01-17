@@ -65,7 +65,7 @@ function Write-Timeline {
                 try { $acc = [int]$entry.AccumMs } catch {}
 
                 if ($entry.CurrentStart) {
-                    # The step runner (Invoke-FoxhoundStep) already adds the attempt's elapsed to AccumMs.
+                    # The step runner (Invoke-Step) already adds the attempt's elapsed to AccumMs.
                     # Prefer AccumMs when it's non-zero to avoid double-counting across places.
                     if ($acc -gt 0) {
                         $totalMs = $acc
@@ -136,7 +136,7 @@ function ConvertTo-ArgumentString {
 # ---------------------------
 # Helper: Resolve script path expressions ($env:FOO, %FOO%, ~, relative -> ProjectRoot)
 # ---------------------------
-function Resolve-FoxhoundScriptPath {
+function Resolve-ScriptPath {
     param(
         [Parameter(Mandatory=$true)] [string]$Path,
         [string]$ProjectRoot
@@ -149,16 +149,16 @@ function Resolve-FoxhoundScriptPath {
 
     # Expand ~ to home
     if ($p -like '~*') {
-        $home = $env:USERPROFILE
+        $homePath = $env:USERPROFILE
         if ($p -eq '~') {
-            $p = $home
+            $p = $homePath
         } else {
             # Remove leading "~", "~/" or "~\" and recompose using Join-Path to avoid quoting issues
             $rest = ($p -replace '^~[\\\/]?','')
             if ([string]::IsNullOrEmpty($rest)) {
                 $p = $home
             } else {
-                $p = Join-Path $home $rest
+                $p = Join-Path $homePath $rest
             }
         }
     }
@@ -190,27 +190,26 @@ function Resolve-FoxhoundScriptPath {
 # ---------------------------
 # Run a single step
 # ---------------------------
-function Invoke-FoxhoundStep {
+function Invoke-Step {
     param (
         [pscustomobject]$Step,
         [string]$ProjectRoot,
         [string]$ManifestName,
         [switch]$InBackgroundJob
         )
-
+                
     $StepId = $Step.id
-    # Resolve any environment-variable expressions and relative paths in the manifest script path
+
     $OrigScriptPath = $Step.script
-    $ScriptPath = Resolve-FoxhoundScriptPath -Path $OrigScriptPath -ProjectRoot $ProjectRoot
+    $ScriptPath = Resolve-ScriptPath -Path $OrigScriptPath -ProjectRoot $ProjectRoot
+
     $TimeoutMs = if ($Step.timeoutMs) { $Step.timeoutMs } else { 30000 }
     $RetryCount = if ($Step.retryCount) { $Step.retryCount } else { 0 }
     $RetryDelayMs = if ($Step.retryDelayMs) { $Step.retryDelayMs } else { 200 }
     $ContinueOnError = if ($Step.continueOnError) { $true } else { $false }
 
-    # Ensure we record the start in the step log (helps for background jobs)
-    Write-StepLog $StepId "Invoked step (background or foreground)." $ProjectRoot $ManifestName
+    Write-StepLog $StepId "Invoked step - $StepId" $ProjectRoot $ManifestName
     
-    # Process args array if defined
     $StepArgsArray = if ($Step.args) { $Step.args } else { @() }
 
     try {
@@ -222,13 +221,10 @@ function Invoke-FoxhoundStep {
             return
         }
 
-        # Determine extension and prepare accurate debug command
-        $ext = [IO.Path]::GetExtension($ScriptPath).ToLower()
-
         # Prepare PS1 arg array for execution display
         $argArray = if ($Step.args) { $Step.args } else { @() }
 
-        # For batch calls we want option/value pairs to be separate tokens (eg -WIDTH 3840)
+        # For batch calls we want option/value pairs to be separate tokens (eg -WIDTH 1920)
         $tokens = @()
         if ($StepArgsArray) {
             foreach ($a in $StepArgsArray) {
@@ -241,6 +237,9 @@ function Invoke-FoxhoundStep {
                 }
             }
         }
+
+        # Determine extension and prepare accurate debug command
+        $ext = [IO.Path]::GetExtension($ScriptPath).ToLower()
 
         if ($ext -eq ".ps1") {
             $psExec = if ($argArray.Count -gt 0) { $argArray | ForEach-Object { '"' + ($_ -replace '"','""') + '"' } -join ' ' } else { '' }
@@ -268,11 +267,12 @@ function Invoke-FoxhoundStep {
         }
 
         Write-Host "FOXHOUND executing $StepId - $ActualCommand"
+        Write-StepLog $StepId "Executing '$ActualCommand'" $ProjectRoot $ManifestName
         
         $attempt = 0
         do {
             $attempt++
-            Write-StepLog $StepId "Starting step attempt $attempt." $ProjectRoot $ManifestName
+            Write-StepLog $StepId "Starting step attempt $attempt/$RetryCount." $ProjectRoot $ManifestName
 
             if (-not $script:FoxhoundTimeline) { $script:FoxhoundTimeline = @{} }
             if (-not $script:FoxhoundTimeline.ContainsKey($StepId)) {
@@ -290,13 +290,89 @@ function Invoke-FoxhoundStep {
             $proc = $null
             $argArray = if ($Step.args) { $Step.args } else { @() }
 
-            if ($ext -eq ".ps1") {
-                $procArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ScriptPath) + $argArray
-                $proc = Start-Process -FilePath (Get-Command powershell).Source -ArgumentList $procArgs -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru
-            } elseif ($ext -eq ".bat" -or $ext -eq ".cmd") {
-                $proc = Start-Process -FilePath (Get-Command cmd.exe).Source -ArgumentList '/c',$cmdInner -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru
+            $isSta = [System.Threading.Thread]::CurrentThread.ApartmentState -eq 'STA'
+
+            # Prepare Start-Process parameters for all cases
+            $startParams = @{
+                RedirectStandardOutput = $outFile
+                RedirectStandardError  = $errFile
+                PassThru               = $true
+            }
+
+            switch ($ext) {
+                '.ps1' {
+                    $startParams.FilePath     = (Get-Command powershell).Source
+                    $startParams.ArgumentList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ScriptPath) + $argArray
+                }
+                { ($_ -eq '.bat') -or ($_ -eq '.cmd') } {
+                    # For '.bat' and '.cmd' we use cmd.exe /c <cmdInner>
+                    $startParams.FilePath     = (Get-Command cmd.exe).Source
+                    $startParams.ArgumentList = @('/c', $cmdInner)
+                }
+                default {
+                    $startParams.FilePath = $ScriptPath
+                }
+            }
+
+            if ($isSta -and $InBackgroundJob) {
+                Write-StepLog $StepId "Starting $ext process in hidden window." $ProjectRoot $ManifestName
+                $startParams.WindowStyle = 'Hidden'
             } else {
-                $proc = Start-Process -FilePath $ScriptPath -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru
+                $startParams.NoNewWindow = $true
+            }
+
+            $proc = Start-Process @startParams
+
+            if ($InBackgroundJob) {
+                if ($proc) {
+                    Write-StepLog $StepId "Started asynchronously: Id=$($proc.Id)" $ProjectRoot $ManifestName
+                } else {
+                    Write-StepLog $StepId "Start-Process returned null for async start." $ProjectRoot $ManifestName
+                }
+
+                # Launch a background job to wait for the process, capture its output and append to the step logs
+                if ($proc) {
+                    $monitor = {
+                        param($processId, $outFile, $errFile, $StepId, $ProjectRoot, $ManifestName)
+
+                        # Prepare log folder
+                        $logsRoot = Join-Path $ProjectRoot "logs"
+                        if ($ManifestName) { $logsFolder = Join-Path $logsRoot $ManifestName } else { $logsFolder = $logsRoot }
+                        if (-not (Test-Path $logsFolder)) { New-Item -ItemType Directory -Path $logsFolder -Force | Out-Null }
+                        $stepLog = Join-Path $logsFolder ("$StepId.log")
+                        $timeline = Join-Path $logsFolder "timeline.log"
+
+                        try {
+                            $p = [System.Diagnostics.Process]::GetProcessById([int]$processId)
+                            $p.WaitForExit()
+                        } catch { }
+
+                        foreach ($f in @($outFile, $errFile)) {
+                            if (Test-Path $f) {
+                                try {
+                                    $lines = Get-Content $f -ErrorAction SilentlyContinue
+                                    foreach ($l in $lines) {
+                                        $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+                                        "$ts | $l" | Out-File -FilePath $stepLog -Append -Encoding UTF8
+                                    }
+                                } catch { }
+                                Remove-Item $f -ErrorAction SilentlyContinue
+                            }
+                        }
+
+                        # Record that the async process finished (optional)
+                        $ts2 = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+                        "$ts2 | $StepId | ASYNC-COMPLETE" | Out-File -FilePath $timeline -Append -Encoding UTF8
+                    }
+
+                    Start-Job -ScriptBlock $monitor -ArgumentList $proc.Id, $outFile, $errFile, $StepId, $ProjectRoot, $ManifestName | Out-Null
+                }
+
+                # Mark success for async start and record timeline then skip waiting/output handling
+                $success = $true
+                Write-Timeline $StepId "STARTED-ASYNC" $ProjectRoot $ManifestName
+                
+                return
             }
 
             # Wait for the process to finish (or time out)
@@ -352,24 +428,24 @@ function Invoke-FoxhoundStep {
                 }
             }
 
-        if (-not $success -and $attempt -le $RetryCount) {
-            Write-StepLog $StepId "Retrying in $RetryDelayMs ms..." $ProjectRoot $ManifestName
-            Start-Sleep -Milliseconds $RetryDelayMs
-        }
+            if (-not $success -and $attempt -le $RetryCount) {
+                Write-StepLog $StepId "Retrying in $RetryDelayMs ms..." $ProjectRoot $ManifestName
+                Start-Sleep -Milliseconds $RetryDelayMs
+            }
 
-    } while (-not $success -and $attempt -le $RetryCount)
+        } while (-not $success -and $attempt -le $RetryCount)
 
-    if ($success) {
+        if ($success) {
             Write-StepLog $StepId "Step completed successfully." $ProjectRoot $ManifestName
-        Write-Timeline $StepId "SUCCESS" $ProjectRoot $ManifestName
-    } elseif (-not $ContinueOnError) {
-        Write-StepLog $StepId "Step failed and ContinueOnError=false. Halting pipeline." $ProjectRoot $ManifestName
-        Write-Timeline $StepId "FAIL" $ProjectRoot $ManifestName
-        throw ([System.Exception]::new("Step $StepId failed."))
-    } else {
-        Write-StepLog $StepId "Step failed but ContinueOnError=true. Continuing." $ProjectRoot $ManifestName
-        Write-Timeline $StepId "FAIL-CONTINUE" $ProjectRoot $ManifestName
-    }
+            Write-Timeline $StepId "SUCCESS" $ProjectRoot $ManifestName
+        } elseif ($ContinueOnError) {
+            Write-StepLog $StepId "Step failed but ContinueOnError=true. Continuing." $ProjectRoot $ManifestName
+            Write-Timeline $StepId "FAIL-CONTINUE" $ProjectRoot $ManifestName
+        } else {
+            Write-StepLog $StepId "Step failed and ContinueOnError=false. Halting pipeline." $ProjectRoot $ManifestName
+            Write-Timeline $StepId "FAIL" $ProjectRoot $ManifestName
+            throw ([System.Exception]::new("Step $StepId failed."))
+        }
 
     } catch {
         Write-StepLog $StepId "Exception: $_" $ProjectRoot $ManifestName
@@ -381,7 +457,7 @@ function Invoke-FoxhoundStep {
 # ---------------------------
 # Run multiple steps from manifest
 # ---------------------------
-function Invoke-FoxhoundManifest {
+function Invoke-Manifest {
     param (
         [string]$ManifestPath,
         [string]$ProjectRoot
@@ -391,78 +467,15 @@ function Invoke-FoxhoundManifest {
         throw "Manifest file not found: $ManifestPath"
     }
 
-    # Startup message is emitted by the caller wrapper script to avoid duplicates
-
-    # Mark run start in logs
     Write-RunSeparator -ProjectRoot $ProjectRoot -ManifestName ([IO.Path]::GetFileNameWithoutExtension($ManifestPath))
 
     $manifest = Get-Content $ManifestPath | ConvertFrom-Json
-    # Short manifest name (filename without extension) for per-manifest logs
     $manifestName = [IO.Path]::GetFileNameWithoutExtension($ManifestPath)
     foreach ($step in $manifest.steps) {
         if ($step.wait) {
-            Invoke-FoxhoundStep -Step $step -ProjectRoot $ProjectRoot -ManifestName $manifestName
+            Invoke-Step -Step $step -ProjectRoot $ProjectRoot -ManifestName $manifestName
         } else {
-            # Fire & forget — prefer Start-Job, but Start-Job can fail or be unavailable when running in STA.
-            Write-Host "FOXHOUND launched background step: $($step.id)"
-            $modulePath = Join-Path $PSScriptRoot "foxhound.psm1"
-
-            # If current thread is STA, Start-Job may not behave as expected; fallback to launching the script with Start-Process.
-            if ([System.Threading.Thread]::CurrentThread.ApartmentState -eq 'STA') {
-                # Resolve script path and args similarly to Invoke-FoxhoundStep
-                $ScriptPath = Resolve-FoxhoundScriptPath -Path $step.script -ProjectRoot $ProjectRoot
-                $StepArgsArray = if ($step.args) { $step.args } else { @() }
-                $ext = [IO.Path]::GetExtension($ScriptPath).ToLower()
-
-                # Build tokenized pieces for batch scripts (same logic as Invoke-FoxhoundStep)
-                $tokens = @()
-                if ($StepArgsArray) {
-                    foreach ($a in $StepArgsArray) {
-                        if ($a -match '^\s*-\S+\s+.+' ) {
-                            $firstSpace = $a.IndexOf(' ')
-                            $tokens += $a.Substring(0,$firstSpace)
-                            $tokens += $a.Substring($firstSpace+1)
-                        } else {
-                            $tokens += $a
-                        }
-                    }
-                }
-
-                # Use temp files for stdout/stderr and hide the process window so background output doesn't go to host.
-                $outFile = [IO.Path]::GetTempFileName()
-                $errFile = [IO.Path]::GetTempFileName()
-
-                if ($ext -eq ".ps1") {
-                    $procArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ScriptPath) + $StepArgsArray
-                    Start-Process -FilePath (Get-Command powershell).Source -ArgumentList $procArgs -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru | Out-Null
-                } elseif ($ext -eq ".bat" -or $ext -eq ".cmd") {
-                    $cmdPieces = @()
-                    foreach ($t in $tokens) {
-                        if ($t -match '\s') {
-                            $cmdPieces += '"' + ($t -replace '"','""') + '"'
-                        } else {
-                            $cmdPieces += $t
-                        }
-                    }
-                    if ($ScriptPath -and $ScriptPath -match '\s') {
-                        $scriptPathInner = '"' + ($ScriptPath -replace '"','""') + '"'
-                    } else {
-                        $scriptPathInner = $ScriptPath
-                    }
-                    $cmdInner = if ($cmdPieces.Count -gt 0) { "$scriptPathInner $($cmdPieces -join ' ')" } else { $scriptPathInner }
-                    Start-Process -FilePath (Get-Command cmd.exe).Source -ArgumentList '/c',$cmdInner -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru | Out-Null
-                } else {
-                    Start-Process -FilePath $ScriptPath -ArgumentList $StepArgsArray -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru | Out-Null
-                }
-
-            } else {
-                # Default behavior: launch as a background job that imports the module and invokes the step.
-                Start-Job -ScriptBlock {
-                    param($s,$p,$m,$mn)
-                    Import-Module $m -Force
-                    Invoke-FoxhoundStep -Step $s -ProjectRoot $p -ManifestName $mn -InBackgroundJob
-                } -ArgumentList $step,$ProjectRoot,$modulePath,$manifestName | Out-Null
-            }
+            Invoke-Step -Step $step -ProjectRoot $ProjectRoot -ManifestName $manifestName -InBackgroundJob
         }
     }
 }
