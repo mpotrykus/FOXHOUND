@@ -1,14 +1,14 @@
-# FOXHOUND Orchestrator
+# FOXHOUND
 
 FOXHOUND is a lightweight PowerShell orchestrator that runs scripted pipeline steps described in JSON manifests. It supports foreground (wait) and background (fire-and-forget) steps, captures stdout/stderr into per-step logs, and writes a timeline summary with per-step durations.
 
 ## Quick start
 1. Put `foxhound.psm1` (module) and `FOXHOUND.ps1` (invoker) in:
-   `c:\Users\mpotr\AppData\Roaming\MyScripts\FOXHOUND.Orchestrator\`
+   `c:\fullpath\`
 2. From PowerShell:
 ```powershell
-Import-Module 'c:\Users\mpotr\AppData\Roaming\MyScripts\FOXHOUND.Orchestrator\foxhound.psm1' -Force
-& 'c:\Users\mpotr\AppData\Roaming\MyScripts\FOXHOUND.Orchestrator\FOXHOUND.ps1' -Manifest 'C:\path\to\manifest.json' -ProjectRoot 'C:\path\to\project'
+Import-Module 'c:\fullpath\foxhound.psm1' -Force
+& 'c:\fullpath\FOXHOUND.ps1' -Manifest 'C:\path\to\manifest.json' -ProjectRoot 'C:\path\to\project'
 ```
 
 ## Manifest format
@@ -74,7 +74,7 @@ A manifest is a JSON object with a `steps` array. Minimal example:
 ```powershell
 $manifest = 'C:\repo\ci\deploy-manifest.json'
 $projectRoot = 'C:\repo'
-Import-Module 'c:\Users\mpotr\AppData\Roaming\MyScripts\FOXHOUND.Orchestrator\foxhound.psm1' -Force
+Import-Module 'c:\fullpath\foxhound.psm1' -Force
 Invoke-FoxhoundManifest -ManifestPath $manifest -ProjectRoot $projectRoot
 ```
 
