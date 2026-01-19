@@ -17,6 +17,79 @@ function Invoke-Manifest {
     $manifest = Get-Content $ManifestPath | ConvertFrom-Json
     $manifestName = [IO.Path]::GetFileNameWithoutExtension($ManifestPath)
 
+    # --- Begin: import / template expansion for reusable manifests ---
+function Replace-PlaceholdersInObject {
+    param([Parameter(Mandatory=$true)] $Obj, [hashtable]$Params)
+    if ($null -eq $Obj) { return $Obj }
+    if ($Obj -is [string]) {
+        $s = $Obj
+        foreach ($k in $Params.Keys) {
+            $s = $s -replace ("\$\{" + [regex]::Escape($k) + "\}"), [string]$Params[$k]
+        }
+        return $s
+    } elseif ($Obj -is [System.Array]) {
+        $arr = @()
+        foreach ($it in $Obj) { $arr += (Replace-PlaceholdersInObject -Obj $it -Params $Params) }
+        return $arr
+    } elseif ($Obj -is [psobject] -or $Obj -is [hashtable]) {
+        $ht = @{}
+        foreach ($p in $Obj.PSObject.Properties) {
+            $ht[$p.Name] = Replace-PlaceholdersInObject -Obj $p.Value -Params $Params
+        }
+        return [pscustomobject]$ht
+    } else {
+        return $Obj
+    }
+}
+
+function Inline-ImportsIntoManifest {
+    param([psobject]$Manifest, [string]$ProjectRoot)
+    if (-not $Manifest.imports) { return $Manifest }
+    $newSteps = @()
+    foreach ($imp in $Manifest.imports) {
+        if (-not $imp.path) { continue }
+        $impPath = Resolve-ScriptPath -Path $imp.path -ProjectRoot $ProjectRoot
+        if (-not (Test-Path $impPath)) { Stop-Run "Imported manifest not found: $($imp.path) -> $impPath" }
+        $impManifest = Get-Content $impPath | ConvertFrom-Json
+        $paramMap = @{}
+        if ($imp.with) {
+            foreach ($kv in $imp.with.PSObject.Properties) { $paramMap[$kv.Name] = $kv.Value }
+        }
+        $prefix = if ($imp.prefix) { $imp.prefix } else { ([IO.Path]::GetFileNameWithoutExtension($impPath)) }
+
+        foreach ($s in $impManifest.steps) {
+            # deep clone
+            $json = $s | ConvertTo-Json -Depth 20
+            $clone = $json | ConvertFrom-Json -ErrorAction Stop
+            # replace placeholders across step object
+            $expanded = Replace-PlaceholdersInObject -Obj $clone -Params $paramMap
+            # prefix id and remap dependsOn entries
+            $oldId = $expanded.id
+            $expanded.id = "$prefix-$($oldId)"
+            if ($expanded.dependsOn) {
+                $newDeps = @()
+                foreach ($d in $expanded.dependsOn) { $newDeps += "$prefix-$d" }
+                $expanded.dependsOn = $newDeps
+            }
+            $newSteps += $expanded
+        }
+
+        # Optionally merge top-level variables (not implemented here)...
+    }
+
+    # Append imported steps after original manifest.steps to preserve ordering
+    $manifest.steps = @($manifest.steps + $newSteps)
+    return $manifest
+}
+
+# Run the import inlining so subsequent code sees an expanded manifest
+try {
+    $manifest = Inline-ImportsIntoManifest -Manifest $manifest -ProjectRoot $ProjectRoot
+} catch {
+    Stop-Run "Failed expanding imports: $_"
+}
+# --- End: import / template expansion for reusable manifests ---
+
     # read maxParallelism (manifest root), default to 4
     $maxParallelism = 4
     try {

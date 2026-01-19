@@ -123,6 +123,57 @@ Notes:
 }
 ```
 
+3) Reusable imported manifests (template expansion)
+Foxhound supports inlining/importing other manifests and expanding placeholders via the [`Inline-ImportsIntoManifest`](foxhound.psm1) helper (used by [`Invoke-Manifest`](foxhound.psm1)). This lets you centralize common step definitions and reuse them with different parameters.
+
+Parent manifest (imports another manifest, adds prefix and parameters):
+```json
+{
+  "name": "parent-pipeline",
+  "version": "1.0",
+  "steps": [
+    {
+      "id": "check-display",
+      "name": "Display check",
+      "script": "scripts\\echo.ps1",
+      "args": ["parent-start"]
+    }
+  ],
+  "imports": [
+    {
+      "path": "common/common-manifest.json",
+      "prefix": "common",
+      "with": {
+        "NAME": "project-42",
+        "RETRIES": 2
+      }
+    }
+  ]
+}
+```
+
+Imported manifest (common/common-manifest.json) showing placeholder usage:
+
+```json
+{
+  "name": "common-steps",
+  "version": "1.0",
+  "steps": [
+    {
+      "id": "setup",
+      "name": "Setup for ${NAME}",
+      "script": "scripts\\setup.ps1",
+      "args": ["--name", "${NAME}", "--retries", "${RETRIES}"]
+    },
+    {
+      "id": "teardown",
+      "name": "Teardown ${NAME}",
+      "script": "scripts\\teardown.ps1"
+    }
+  ]
+}
+```
+
 Notes / tips
 - Use `wait: true` on steps you must block on; by default steps run backgrounded when possible to increase parallelism.
 - Inspect timeline.log and per-step .log files for quick debugging; artifacts in the artifacts folder contain structured run/step data.
