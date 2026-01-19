@@ -426,7 +426,7 @@ function Invoke-Step {
 # ---------------------------
 function Start-FoxhoundMonitor {
     param(
-        [Parameter(Mandatory=$true)][int]$Pid,
+        [Parameter(Mandatory=$true)][int]$stepPid,
         [Parameter(Mandatory=$true)][string]$OutFile,
         [Parameter(Mandatory=$true)][string]$ErrFile,
         [Parameter(Mandatory=$true)][string]$StepId,
@@ -451,7 +451,7 @@ function Start-FoxhoundMonitor {
         while ($true) {
             $proc = $null
             try {
-                $proc = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+                $proc = Get-Process -Id $stepPid -ErrorAction SilentlyContinue
             } catch {
                 $proc = $null
             }
@@ -480,7 +480,7 @@ function Start-FoxhoundMonitor {
         # Try to get exit code if process still queryable
         $exitCode = $null
         try {
-            $p = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+            $p = Get-Process -Id $stepPid -ErrorAction SilentlyContinue
             if ($p) { $exitCode = $p.ExitCode }
         } catch {
             $exitCode = $null
@@ -847,11 +847,11 @@ function Start-ReadySteps {
     # Ensure we have a monitor tracking table and prune entries for monitors that have exited
     if (-not $script:FoxhoundActiveMonitors) { $script:FoxhoundActiveMonitors = @{} }
     $toRemove = @()
-    foreach ($pid in $script:FoxhoundActiveMonitors.Keys) {
+    foreach ($steppid in $script:FoxhoundActiveMonitors.Keys) {
         try {
-            $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+            $p = Get-Process -Id $steppid -ErrorAction SilentlyContinue
         } catch { $p = $null }
-        if (-not $p) { $toRemove += $pid }
+        if (-not $p) { $toRemove += $steppid }
     }
     foreach ($k in $toRemove) { $script:FoxhoundActiveMonitors.Remove($k) | Out-Null }
  
