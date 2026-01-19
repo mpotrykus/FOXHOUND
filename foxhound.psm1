@@ -17,6 +17,15 @@ function Invoke-Manifest {
     $manifest = Get-Content $ManifestPath | ConvertFrom-Json
     $manifestName = [IO.Path]::GetFileNameWithoutExtension($ManifestPath)
 
+    # read maxParallelism (manifest root), default to 4
+    $maxParallelism = 4
+    try {
+        if ($manifest.maxParallelism) {
+            $maxParallelism = [int]$manifest.maxParallelism
+            if ($maxParallelism -lt 1) { $maxParallelism = 1 }
+        }
+    } catch { $maxParallelism = 4 }
+
     # record current run context so helpers can write/read artifacts/data
     $script:CurrentProjectRoot = $ProjectRoot
     $script:CurrentManifestName = $manifestName
@@ -78,7 +87,7 @@ function Invoke-Manifest {
             Stop-Run  "Stuck scheduling steps (possible cycle in dependsOn). Statuses: $($statuses | Out-String)"
         }
 
-        $started = Start-ReadySteps -StepsById $stepsById -Statuses $statuses -ProjectRoot $ProjectRoot -ManifestName $manifestName -ActiveJobs $activeJobs
+        $started = Start-ReadySteps -StepsById $stepsById -Statuses $statuses -ProjectRoot $ProjectRoot -ManifestName $manifestName -ActiveJobs $activeJobs -MaxParallelism $maxParallelism
 
         # Process completed jobs
         $completedJobs = Get-Job | Where-Object { $_.State -in @('Completed','Failed','Stopped','Blocked') }
@@ -117,14 +126,15 @@ function Invoke-Manifest {
         }
         if (-not $pendingOrRunning) { break }
 
-        # If nothing started this iteration and there are running jobs, wait briefly for jobs to complete
-        if (-not $started -and ($activeJobs.Count -gt 0)) {
+        # If nothing started this iteration and there are running jobs or active monitors, wait briefly for jobs to complete
+        $hasMonitors = ($script:FoxhoundActiveMonitors -and $script:FoxhoundActiveMonitors.Count -gt 0)
+        if (-not $started -and (($activeJobs.Count -gt 0) -or $hasMonitors)) {
             Start-Sleep -Milliseconds 200
             continue
         }
-
+ 
         # If nothing started, no active jobs, but still pending steps -> cycle or unsatisfiable deps
-        if (-not $started -and ($activeJobs.Count -eq 0)) {
+        if (-not $started -and ($activeJobs.Count -eq 0) -and (-not $hasMonitors)) {
             # Mark remaining pending steps as skipped to break cycle, and Abort-Run 
             $remaining = $statuses.Keys | Where-Object { $statuses[$_] -eq 'Pending' }
             if ($remaining.Count -gt 0) {
@@ -312,6 +322,14 @@ function Invoke-Step {
                 )
 
                 Start-Process -FilePath $psExe -ArgumentList $monitorArgs -WindowStyle Hidden -WorkingDirectory $ProjectRoot | Out-Null
+                # track monitor processes so we can bound parallelism
+                try {
+                    $monitorProc = Start-Process -FilePath $psExe -ArgumentList $monitorArgs -WindowStyle Hidden -WorkingDirectory $ProjectRoot -PassThru -ErrorAction SilentlyContinue
+                    if ($monitorProc) {
+                        if (-not $script:FoxhoundActiveMonitors) { $script:FoxhoundActiveMonitors = @{} }
+                        $script:FoxhoundActiveMonitors[$monitorProc.Id] = $StepId
+                    }
+                } catch {}
 
                 # Record started-async and return immediate success so dependents run without waiting
                 Write-Timeline $StepId "STARTED-ASYNC" $ProjectRoot $ManifestName
@@ -819,18 +837,30 @@ function Start-ReadySteps {
         [Parameter(Mandatory=$true)] [hashtable]$Statuses,
         [string]$ProjectRoot,
         [string]$ManifestName,
-        [Parameter(Mandatory=$true)] [hashtable]$ActiveJobs
+        [Parameter(Mandatory=$true)] [hashtable]$ActiveJobs,
+        [int]$MaxParallelism = 4
     )
-
+ 
     # Refresh any on-disk step data (from async monitors) so conditions see latest values
     Update-StepDataFromLogs -ProjectRoot $ProjectRoot -ManifestName $ManifestName
 
-    $startedAny = $false
-    foreach ($id in $StepsById.Keys) {
-        if ($Statuses[$id] -ne 'Pending') { continue }
-        $step = $StepsById[$id]
-        $deps = if ($step.dependsOn) { $step.dependsOn } else { @() }
-
+    # Ensure we have a monitor tracking table and prune entries for monitors that have exited
+    if (-not $script:FoxhoundActiveMonitors) { $script:FoxhoundActiveMonitors = @{} }
+    $toRemove = @()
+    foreach ($pid in $script:FoxhoundActiveMonitors.Keys) {
+        try {
+            $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        } catch { $p = $null }
+        if (-not $p) { $toRemove += $pid }
+    }
+    foreach ($k in $toRemove) { $script:FoxhoundActiveMonitors.Remove($k) | Out-Null }
+ 
+     $startedAny = $false
+     foreach ($id in $StepsById.Keys) {
+         if ($Statuses[$id] -ne 'Pending') { continue }
+         $step = $StepsById[$id]
+         $deps = if ($step.dependsOn) { $step.dependsOn } else { @() }
+ 
         # Validate dependencies exist
         foreach ($d in $deps) {
             if (-not $StepsById.Contains($d)) {
@@ -858,14 +888,20 @@ function Start-ReadySteps {
             if ($Statuses[$d] -ne 'Success') { $allDepsDone = $false; break }
         }
         if ($allDepsDone) {
+            # Enforce maxParallelism: active = tracked monitors + ActiveJobs
+            $currentActive = ($ActiveJobs.Count) + ($script:FoxhoundActiveMonitors.Count)
+            if ($currentActive -ge $MaxParallelism) {
+                # skip starting more this iteration
+                continue
+            }
             # Start this step
-            $inBg = -not ($step.wait)
-            Write-StepLog $id "Scheduling step. Background=$inBg" $ProjectRoot $ManifestName
-            $result = Invoke-Step -Step $step -ProjectRoot $ProjectRoot -ManifestName $ManifestName -InBackgroundJob:($inBg)
-
-            # Record that we attempted to start something this iteration
-            $startedAny = $true
-
+             $inBg = -not ($step.wait)
+             Write-StepLog $id "Scheduling step. Background=$inBg" $ProjectRoot $ManifestName
+             $result = Invoke-Step -Step $step -ProjectRoot $ProjectRoot -ManifestName $ManifestName -InBackgroundJob:($inBg)
+ 
+             # Record that we attempted to start something this iteration
+             $startedAny = $true
+ 
             if ($result -is [System.Management.Automation.Job]) {
                 $job = $result
                 $ActiveJobs[$job.Id] = $id
