@@ -17,6 +17,13 @@ function Invoke-Manifest {
     $manifest = Get-Content $ManifestPath | ConvertFrom-Json
     $manifestName = [IO.Path]::GetFileNameWithoutExtension($ManifestPath)
 
+    # record current run context so helpers can write/read artifacts/data
+    $script:CurrentProjectRoot = $ProjectRoot
+    $script:CurrentManifestName = $manifestName
+
+    # Initialize the in-memory ExecutionContext.Steps so Set-StepData can attach data
+    Initialize-FoxhoundExecutionContext
+
     # Build step map
     # preserve manifest order for scheduling
     $stepsById = [ordered]@{
@@ -107,6 +114,11 @@ function Invoke-Manifest {
         }
     }
 
+    # Print a single ExecutionContext snapshot now that the run is finished.
+    $execJson = $ExecutionContext.Steps['check-display'].Data.Name | ConvertTo-Json -Depth 10 -ErrorAction Stop
+    Write-Host $execJson
+   
+
     # Final summary: log statuses
     foreach ($id in $statuses.Keys) {
         Write-StepLog $id "Final status: $($statuses[$id])" $ProjectRoot $manifestName
@@ -122,6 +134,9 @@ function Invoke-Manifest {
         if ($s.Value -eq 'Failed') { $anyFailed = $true; break }
     }
     if ($anyFailed) { Stop-Run "One or more steps failed. See logs for details." }
+
+    # Emit run artifact at the end of manifest execution
+    Send-RunArtifact -StepsById $stepsById -Statuses $statuses -ProjectRoot $ProjectRoot -ManifestName $manifestName | Out-Null
 }
 
 # Keep Invoke-Step near top as a main executor
@@ -266,6 +281,9 @@ function Invoke-Step {
 
                 Write-StepLog $StepId "Started asynchronously: Id=$($proc.Id)" $ProjectRoot $ManifestName
 
+                # record an initial entry so conditions can see that step started async
+                Set-StepData -StepId $StepId -Data $null -Output @() -ErrLines @() -Combined "" -ExitCode $proc.Id -Status 'STARTED-ASYNC' | Out-Null
+
                 # Build detached monitor script (written to temp file) so it can finish logging after foxhound exits
                 $monitorPath = Join-Path ([IO.Path]::GetTempPath()) ("foxhound-monitor-$($StepId)-$([Guid]::NewGuid().ToString()).ps1")
                 $monitorScript = New-MonitorScript
@@ -304,11 +322,11 @@ function Invoke-Step {
                 $exitCode = $null
             } else {
                 # Read and write captured output (store for inspection)
-                $outLines = @()
+                $output = @()
                 $errLines = @()
                 if (Test-Path $outFile) {
-                    $outLines = Get-Content $outFile -ErrorAction SilentlyContinue
-                    foreach ($l in $outLines) { Write-StepLog $StepId $l $ProjectRoot $ManifestName }
+                    $output = Get-Content $outFile -ErrorAction SilentlyContinue
+                    foreach ($l in $output) { Write-StepLog $StepId $l $ProjectRoot $ManifestName }
                     Remove-Item $outFile -ErrorAction SilentlyContinue
                 }
                 if (Test-Path $errFile) {
@@ -321,8 +339,11 @@ function Invoke-Step {
                 $exitCode = $null
                 try { $exitCode = $proc.ExitCode } catch { $exitCode = $null }
 
-                $combinedText = (($outLines + $errLines) -join "`n").ToString()
+                $combinedText = (($output + $errLines) -join "`n").ToString()
                 $errorPattern = '(?i)\b(error|exception|failed|cannot|not found|no such file|invalid|syntax is incorrect)\b'
+
+                # Parse structured data if present
+                $parsedData = ParseOutputToData -Output $output -ErrLines $errLines -CombinedText $combinedText
 
                 if ($null -ne $exitCode -and $exitCode -ne 0) {
                     Write-StepLog $StepId "Process exited with code $exitCode." $ProjectRoot $ManifestName
@@ -333,6 +354,10 @@ function Invoke-Step {
                 } else {
                     $success = $true
                 }
+
+                # Store parsed output/data for other steps to reference
+                $statusStr = if ($success) { 'SUCCESS' } else { 'FAIL' }
+                Set-StepData -StepId $StepId -Data $parsedData -Output $output -ErrLines $errLines -Combined $combinedText -ExitCode $exitCode -Status $statusStr | Out-Null
             }
 
             if (-not $success -and $attempt -le $RetryCount) {
@@ -359,8 +384,277 @@ function Invoke-Step {
     }
 }
 
-# Large task methods (scheduling etc.)
+# ---------------------------
+# Execution context / step-data helpers
+# ---------------------------
+function Initialize-FoxhoundExecutionContext {
+    # Ensure an in-memory steps store and expose it on $ExecutionContext as .Steps
+    if (-not $script:FoxhoundSteps) { $script:FoxhoundSteps = @{} }
+    try {
+        if (-not $ExecutionContext.PSObject.Properties['Steps']) {
+            $ExecutionContext | Add-Member -MemberType NoteProperty -Name Steps -Value $script:FoxhoundSteps -Force
+        } else {
+            $ExecutionContext.Steps = $script:FoxhoundSteps
+        }
+    } catch { }
+}
 
+function ParseOutputToData {
+    param(
+        [string[]]$Output,
+        [string[]]$ErrLines,
+        [string]$CombinedText
+    )
+    # Prefer explicit marker: lines like "FOXHOUND:DATA { ...json... }"
+    $all = @()
+    if ($Output) { $all += $Output }
+    if ($ErrLines) { $all += $ErrLines }
+
+    foreach ($l in $all) {
+        if ($l -match '^\s*FOXHOUND:DATA\s+(.*)$') {
+            $json = $Matches[1].Trim()
+            try { return $json | ConvertFrom-Json -ErrorAction Stop } catch { break }
+        }
+    }
+
+    # Try to parse the entire combined output as JSON (handles multi-line JSON)
+    if ($CombinedText) {
+        $combinedTrim = $CombinedText.Trim()
+        if ($combinedTrim.StartsWith('{') -and $combinedTrim.EndsWith('}')) {
+            try { return $combinedTrim | ConvertFrom-Json -ErrorAction Stop } catch {}
+        }
+    }
+
+    # Try joining Output into a single JSON block (multi-line JSON printed to stdout)
+    if ($Output) {
+        $joined = ($Output -join "`n").Trim()
+        if ($joined.StartsWith('{') -and $joined.EndsWith('}')) {
+            try { return $joined | ConvertFrom-Json -ErrorAction Stop } catch {}
+        }
+    }
+
+    # If no explicit marker, try to find a JSON object line (single-line JSON)
+    foreach ($l in $all) {
+        $t = $l.Trim()
+        if ($t.StartsWith('{') -and $t.EndsWith('}')) {
+            try { return $t | ConvertFrom-Json -ErrorAction Stop } catch { break }
+        }
+    }
+
+    # Fallback: parse simple key=value lines into a hashtable
+    $ht = @{
+    }
+    foreach ($l in $all) {
+        if ($l -match '^\s*([A-Za-z0-9_]+)\s*=\s*(.+)$') {
+            $ht[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+    if ($ht.Count -gt 0) { return $ht }
+
+    return $null
+}
+
+function Set-StepData {
+    param(
+        [string]$StepId,
+        $Data,
+        [string[]]$Output,
+        [string[]]$ErrLines,
+        [string]$Combined,
+        [int]$ExitCode,
+        [string]$Status
+    )
+    if (-not $script:FoxhoundSteps) { $script:FoxhoundSteps = @{} }
+    $entry = [pscustomobject]@{
+        StepId    = $StepId
+        Data      = $Data
+        Output  = $Output
+        ErrLines  = $ErrLines
+        Combined  = $Combined
+        ExitCode  = $ExitCode
+        Status    = $Status
+        Timestamp = (Get-Date).ToString("o")
+    }
+    $script:FoxhoundSteps[$StepId] = $entry
+    try { $ExecutionContext.Steps = $script:FoxhoundSteps } catch {}
+
+    # Do NOT write a per-step .data.json here; rely on .artifact.json as the canonical artifact.
+    # Emit artifact for this step (if we can determine logs location)
+    try {
+        if ($script:CurrentProjectRoot -and $script:CurrentManifestName) {
+            Send-StepArtifact -StepId $StepId -Entry $entry -ProjectRoot $script:CurrentProjectRoot -ManifestName $script:CurrentManifestName
+        }
+    } catch { }
+
+    return $entry
+}
+
+# ---------------------------
+# Artifact helpers
+# ---------------------------
+function Get-LogsFolderPath {
+    param(
+        [string]$ProjectRoot,
+        [string]$ManifestName
+    )
+    # Manifest root (ProjectRoot\<ManifestName>) or ProjectRoot when no manifest name
+    if ($ManifestName) {
+        $manifestRoot = Join-Path $ProjectRoot $ManifestName
+    } else {
+        $manifestRoot = $ProjectRoot
+    }
+
+    # Single manifest-level logs folder: <manifestRoot>\logs
+    $logsFolder = Join-Path $manifestRoot "logs"
+    if (-not (Test-Path $logsFolder)) { New-Item -ItemType Directory -Path $logsFolder -Force | Out-Null }
+    return $logsFolder
+}
+
+function Get-ArtifactsFolderPath {
+    param(
+        [string]$ProjectRoot,
+        [string]$ManifestName
+    )
+    if ($ManifestName) {
+        $manifestRoot = Join-Path $ProjectRoot $ManifestName
+    } else {
+        $manifestRoot = $ProjectRoot
+    }
+
+    # Single manifest-level artifacts folder: <manifestRoot>\artifacts
+    $artFolder = Join-Path $manifestRoot "artifacts"
+    if (-not (Test-Path $artFolder)) { New-Item -ItemType Directory -Path $artFolder -Force | Out-Null }
+    return $artFolder
+}
+
+# ---------------------------
+# Artifact helpers (updated to use artifacts folder)
+function New-StepArtifactObject {
+    param(
+        [string]$StepId,
+        [psobject]$Entry,
+        [string]$ProjectRoot,
+        [string]$ManifestName
+    )
+
+    # Manifest-level logs and artifacts
+    $logsFolder = Get-LogsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    $artifactsFolder = Get-ArtifactsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+
+    # Try to obtain duration from timeline accumulator if present
+    $durationMs = $null
+    if ($script:FoxhoundTimeline -and $script:FoxhoundTimeline.ContainsKey($StepId)) {
+        try { $durationMs = [int]$script:FoxhoundTimeline[$StepId].AccumMs } catch {}
+    }
+    $startTime = $null
+    if ($durationMs -ne $null) {
+        try { $startTime = (Get-Date).AddMilliseconds(-$durationMs).ToString("o") } catch {}
+    }
+
+    $artifact = [pscustomobject]@{
+        StepId       = $StepId
+        Status       = $Entry.Status
+        ExitCode     = $Entry.ExitCode
+        Data         = $Entry.Data
+        Output       = if ($Entry.Output) { $Entry.Output } else { $Entry.OutLines }
+        ErrLines     = $Entry.ErrLines
+        Combined     = $Entry.Combined
+        DurationMs   = $durationMs
+        StartTime    = $startTime
+        LogPath      = (Join-Path $logsFolder ("$StepId.log"))
+        DataPath     = (Join-Path $logsFolder ("$StepId.data.json"))
+        ArtifactPath = (Join-Path $artifactsFolder ("$StepId.artifact.json"))
+        Timestamp    = $Entry.Timestamp
+    }
+    return $artifact
+}
+
+function Send-StepArtifact {
+    param(
+        [string]$StepId,
+        [psobject]$Entry,
+        [string]$ProjectRoot,
+        [string]$ManifestName
+    )
+    $artifactsFolder = Get-ArtifactsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    $artifact = New-StepArtifactObject -StepId $StepId -Entry $Entry -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    $artifactFile = Join-Path $artifactsFolder ("$StepId.artifact.json")
+    try {
+        $artifact | ConvertTo-Json -Depth 10 | Out-File -FilePath $artifactFile -Encoding UTF8 -Force
+    } catch { }
+    return $artifactFile
+}
+
+function New-RunArtifact {
+    param(
+        [hashtable]$StepsById,
+        [hashtable]$Statuses,
+        [string]$ProjectRoot,
+        [string]$ManifestName
+    )
+
+    $nodes = @()
+    foreach ($id in $StepsById.Keys) {
+        $step = $StepsById[$id]
+        $entry = $null
+        if ($script:FoxhoundSteps -and $script:FoxhoundSteps.ContainsKey($id)) { $entry = $script:FoxhoundSteps[$id] }
+
+        $artifactNode = [pscustomobject]@{
+            Id = $id
+            Name = $step.name
+            Status = if ($Statuses.ContainsKey($id)) { $Statuses[$id] } else { ($entry.Status -or 'Unknown') }
+            DependsOn = if ($step.dependsOn) { $step.dependsOn } else { @() }
+            ArtifactPath = if ($ProjectRoot) { (Join-Path (Get-ArtifactsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName) ("$id.artifact.json")) } else { $null }
+            Data = if ($entry) { $entry.Data } else { $null }
+        }
+        $nodes += $artifactNode
+    }
+
+    $edges = @()
+    foreach ($n in $nodes) {
+        foreach ($d in $n.DependsOn) {
+            $edges += [pscustomobject]@{ From = $d; To = $n.Id }
+        }
+    }
+
+    $totalMs = 0
+    foreach ($n in $nodes) {
+        $dur = $null
+        if ($script:FoxhoundTimeline -and $script:FoxhoundTimeline.ContainsKey($n.Id)) {
+            try { $dur = [int]$script:FoxhoundTimeline[$n.Id].AccumMs } catch {}
+        }
+        if ($dur) { $totalMs += $dur }
+    }
+
+    $artifact = [pscustomobject]@{
+        Manifest = $ManifestName
+        ProjectRoot = $ProjectRoot
+        Nodes = $nodes
+        Edges = $edges
+        TotalDurationMs = $totalMs
+        GeneratedAt = (Get-Date).ToString("o")
+    }
+    return $artifact
+}
+
+function Send-RunArtifact {
+    param(
+        [hashtable]$StepsById,
+        [hashtable]$Statuses,
+        [string]$ProjectRoot,
+        [string]$ManifestName
+    )
+    $artifactsFolder = Get-ArtifactsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    $runArtifact = New-RunArtifact -StepsById $StepsById -Statuses $Statuses -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    $artifactFile = Join-Path $artifactsFolder ("$ManifestName.artifact.json")
+    try {
+        $runArtifact | ConvertTo-Json -Depth 20 | Out-File -FilePath $artifactFile -Encoding UTF8 -Force
+    } catch { }
+    return $artifactFile
+}
+
+# ---------------------------
+# Large task methods (scheduling etc.)
 function Start-ReadySteps {
     param(
         [Parameter(Mandatory=$true)] [hashtable]$StepsById,
@@ -369,6 +663,9 @@ function Start-ReadySteps {
         [string]$ManifestName,
         [Parameter(Mandatory=$true)] [hashtable]$ActiveJobs
     )
+
+    # Refresh any on-disk step data (from async monitors) so conditions see latest values
+    Update-StepDataFromLogs -ProjectRoot $ProjectRoot -ManifestName $ManifestName
 
     $startedAny = $false
     foreach ($id in $StepsById.Keys) {
@@ -435,30 +732,23 @@ function Start-ReadySteps {
 
 # Helper methods (after large tasks)
 
-function Get-LogsFolderPath {
-    param(
-        [string]$ProjectRoot,
-        [string]$ManifestName
-    )
-    $logsRoot = Join-Path $ProjectRoot "logs"
-    if ($ManifestName) {
-        $logsFolder = Join-Path $logsRoot $ManifestName
-    } else {
-        $logsFolder = $logsRoot
-    }
-    if (-not (Test-Path $logsFolder)) { New-Item -ItemType Directory -Path $logsFolder -Force | Out-Null }
-    return $logsFolder
-}
-
+# ---------------------------
+# Helper: Build monitor script
+# ---------------------------
 function New-MonitorScript {
     # returns the content of the detached monitor script (literal, no interpolation)
     return @'
 param($processId,$outFile,$errFile,$StepId,$ProjectRoot,$ManifestName)
 
-$logsRoot = Join-Path $ProjectRoot "logs"
-if ($ManifestName) { $logsFolder = Join-Path $logsRoot $ManifestName } else { $logsFolder = $logsRoot }
+# Manifest root and manifest-level logs folder:
+$manifestRoot = if ($ManifestName) { Join-Path $ProjectRoot $ManifestName } else { $ProjectRoot }
+$logsFolder = Join-Path $manifestRoot "logs"
 if (-not (Test-Path $logsFolder)) { New-Item -ItemType Directory -Path $logsFolder -Force | Out-Null }
+$artifactsFolder = Join-Path $manifestRoot "artifacts"
+if (-not (Test-Path $artifactsFolder)) { New-Item -ItemType Directory -Path $artifactsFolder -Force | Out-Null }
+
 $stepLog = Join-Path $logsFolder ("$StepId.log")
+# Run-level timeline at manifest root
 $timeline = Join-Path $logsFolder "timeline.log"
 
 $p = $null
@@ -467,7 +757,7 @@ try {
     $p.WaitForExit()
 } catch { }
 
-$outLines = @()
+$output = @()
 $errLines = @()
 foreach ($f in @($outFile, $errFile)) {
     if (Test-Path $f) {
@@ -477,7 +767,7 @@ foreach ($f in @($outFile, $errFile)) {
                 $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
                 "$ts | $l" | Out-File -FilePath $stepLog -Append -Encoding UTF8
             }
-            if ($f -eq $outFile) { $outLines = $lines }
+            if ($f -eq $outFile) { $output = $lines }
             if ($f -eq $errFile) { $errLines = $lines }
         } catch { }
         Remove-Item $f -ErrorAction SilentlyContinue
@@ -487,21 +777,64 @@ foreach ($f in @($outFile, $errFile)) {
 $exitCode = $null
 try { if ($p) { $exitCode = $p.ExitCode } } catch { $exitCode = $null }
 
-$combinedText = (($outLines + $errLines) -join "`n").ToString()
+$combinedText = (($output + $errLines) -join "`n").ToString()
 $errorPattern = '(?i)\b(error|exception|failed|cannot|not found|no such file|invalid|syntax is incorrect)\b'
 
+$status = ''
 if ($null -ne $exitCode -and $exitCode -ne 0) {
     "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')) | $StepId | Process exited with code $exitCode" | Out-File -FilePath $timeline -Append -Encoding UTF8
+    $status = 'FAIL'
 } elseif ($combinedText -and ($combinedText -match $errorPattern)) {
     "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')) | $StepId | Detected error-like text in output; treating step as failed." | Out-File -FilePath $timeline -Append -Encoding UTF8
+    $status = 'FAIL'
 } else {
     "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')) | $StepId | SUCCESS" | Out-File -FilePath $timeline -Append -Encoding UTF8
+    $status = 'SUCCESS'
 }
+
+# Attempt to parse structured data from output (prefer explicit marker)
+$data = $null
+foreach ($l in ($output + $errLines)) {
+    if ($l -match '^\s*FOXHOUND:DATA\s+(.*)$') {
+        $json = $Matches[1].Trim()
+        try { $data = $json | ConvertFrom-Json -ErrorAction Stop; break } catch { $data = $null }
+    }
+}
+if (-not $data) {
+    foreach ($l in ($output + $errLines)) {
+        $t = $l.Trim()
+        if ($t.StartsWith('{') -and $t.EndsWith('}')) {
+            try { $data = $t | ConvertFrom-Json -ErrorAction Stop; break } catch { $data = $null }
+        }
+    }
+}
+
+# Build artifact object and write manifest-level artifact file (do NOT write .data.json)
+$artifact = [pscustomobject]@{
+    StepId       = $StepId
+    Status       = $status
+    ExitCode     = $exitCode
+    Data         = $data
+    Output       = if ($output) { $output } else { @() }
+    ErrLines     = $errLines
+    Combined     = $combinedText
+    DurationMs   = $null
+    StartTime    = $null
+    LogPath      = (Join-Path $logsFolder ("$StepId.log"))
+    DataPath     = (Join-Path $logsFolder ("$StepId.data.json"))  # path retained for compatibility but not written
+    ArtifactPath = (Join-Path $artifactsFolder ("$StepId.artifact.json"))
+    Timestamp    = (Get-Date).ToString("o")
+}
+
+$artifactFile = $artifact.ArtifactPath
+try { $artifact | ConvertTo-Json -Depth 10 | Out-File -FilePath $artifactFile -Encoding UTF8 -Force } catch {}
 
 # attempt to remove ourself
 try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue } catch {}
 '@
 }
+
+# Helper methods (logging, etc.)
 
 function Write-StepLog {
     param (
@@ -511,6 +844,7 @@ function Write-StepLog {
         [string]$ManifestName
     )
 
+    # Write into manifest-level logs folder (files named <StepId>.log)
     $logsFolder = Get-LogsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
 
     $logFile = Join-Path $logsFolder "${StepId}.log"
@@ -526,9 +860,10 @@ function Write-Timeline {
         [string]$ManifestName
     )
 
-    $logsFolder = Get-LogsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    # Run-level timeline stays in manifest-level logs folder
+    $manifestLogsFolder = Get-LogsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    $timelineFile = Join-Path $manifestLogsFolder "timeline.log"
 
-    $timelineFile = Join-Path $logsFolder "timeline.log"
     $now = Get-Date
     $timestamp = $now.ToString("yyyy-MM-dd HH:mm:ss.fff")
 
@@ -551,8 +886,6 @@ function Write-Timeline {
                 try { $acc = [int]$entry.AccumMs } catch {}
 
                 if ($entry.CurrentStart) {
-                    # The step runner (Invoke-Step) already adds the attempt's elapsed to AccumMs.
-                    # Prefer AccumMs when it's non-zero to avoid double-counting across places.
                     if ($acc -gt 0) {
                         $totalMs = $acc
                     } else {
@@ -582,16 +915,19 @@ function Write-RunSeparator {
         [string]$ManifestName
     )
 
-    $logsFolder = Get-LogsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+    # Write separator to manifest-level timeline and all step logs in manifest logs folder
+    $manifestLogsFolder = Get-LogsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
 
     $sep = "==================== RUN START: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff') ===================="
-    $timelineFile = Join-Path $logsFolder "timeline.log"
+    $timelineFile = Join-Path $manifestLogsFolder "timeline.log"
     $sep | Out-File -FilePath $timelineFile -Append -Encoding UTF8
 
-    # Also write a separator to each step log header file, excluding timeline.log
-    Get-ChildItem -Path $logsFolder -Filter "*.log" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'timeline.log' } | ForEach-Object {
-        $path = $_.FullName
-        $sep | Out-File -FilePath $path -Append -Encoding UTF8
+    # Append to each step log file in manifest-level logs folder (exclude timeline.log)
+    if (Test-Path $manifestLogsFolder) {
+        Get-ChildItem -Path $manifestLogsFolder -Filter "*.log" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'timeline.log' } | ForEach-Object {
+            $path = $_.FullName
+            $sep | Out-File -FilePath $path -Append -Encoding UTF8
+        }
     }
 }
 
@@ -682,4 +1018,52 @@ function Stop-Run {
         [Console]::ForegroundColor = $prevColor
     }
     exit $ExitCode
+}
+
+# ---------------------------
+# Helper: Refresh step-data from on-disk .data.json files
+# ---------------------------
+function Update-StepDataFromLogs {
+    param(
+        [string]$ProjectRoot,
+        [string]$ManifestName
+    )
+
+    if (-not $ProjectRoot) { return }
+    # Base manifest folder
+    try {
+        $manifestRoot = if ($ManifestName) { Join-Path $ProjectRoot $ManifestName } else { $ProjectRoot }
+    } catch { return }
+    if (-not (Test-Path $manifestRoot)) { return }
+
+    if (-not $script:FoxhoundSteps) { $script:FoxhoundSteps = @{} }
+
+    # Read .data.json files from manifest-level logs folder
+    $manifestLogs = Join-Path $manifestRoot "logs"
+    if (-not (Test-Path $manifestLogs)) { return }
+
+    $files = Get-ChildItem -Path $manifestLogs -Filter '*.data.json' -File -ErrorAction SilentlyContinue
+    if (-not $files) { return }
+
+    foreach ($f in $files) {
+        try {
+            $raw = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
+            if (-not $raw) { continue }
+            $j = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($j -and $j.StepId) {
+                $script:FoxhoundSteps[$j.StepId] = [pscustomobject]@{
+                    StepId    = $j.StepId
+                    Data      = $j.Data
+                    Output    = if ($j.Output) { $j.Output } else { $j.OutLines }
+                    ErrLines  = $j.ErrLines
+                    Combined  = $j.Combined
+                    ExitCode  = $j.ExitCode
+                    Status    = $j.Status
+                    Timestamp = $j.Timestamp
+                }
+            }
+        } catch { continue }
+    }
+
+    try { $ExecutionContext.Steps = $script:FoxhoundSteps } catch {}
 }
