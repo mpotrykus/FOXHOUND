@@ -819,7 +819,8 @@ function Send-StepArtifact {
 
 function New-RunArtifact {
     param(
-        [hashtable]$StepsById,
+        #[hashtable]$StepsById,
+        [System.Collections.IDictionary]$StepsById,
         [hashtable]$Statuses,
         [string]$ProjectRoot,
         [string]$ManifestName
@@ -894,7 +895,8 @@ function New-RunArtifact {
 
 function Send-RunArtifact {
     param(
-        [hashtable]$StepsById,
+        #[hashtable]$StepsById,
+        [System.Collections.IDictionary]$StepsById,
         [hashtable]$Statuses,
         [string]$ProjectRoot,
         [string]$ManifestName
@@ -913,7 +915,7 @@ function Send-RunArtifact {
 # ---------------------------
 function Start-ReadySteps {
     param(
-        [Parameter(Mandatory=$true)] [hashtable]$StepsById,
+        [Parameter(Mandatory=$true)] [System.Collections.IDictionary]$StepsById,
         [Parameter(Mandatory=$true)] [hashtable]$Statuses,
         [string]$ProjectRoot,
         [string]$ManifestName,
