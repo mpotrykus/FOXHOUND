@@ -24,17 +24,29 @@ function Invoke-Manifest {
     # Initialize the in-memory ExecutionContext.Steps so Set-StepData can attach data
     Initialize-FoxhoundExecutionContext
 
+    # Per-step config (generateArtifact flag defaults to $true)
+    if (-not $script:FoxhoundStepConfig) { $script:FoxhoundStepConfig = @{} }
+
     # Build step map
     # preserve manifest order for scheduling
     $stepsById = [ordered]@{ }
     foreach ($s in $manifest.steps) {
         $stepsById[$s.id] = $s
         # Normalize dependsOn to array
-        if (-not $s.PSObject.Properties.Name -contains 'dependsOn') {
+        if (-not ($s.PSObject.Properties.Name -contains 'dependsOn')) {
             $s | Add-Member -NotePropertyName dependsOn -NotePropertyValue @() -Force
         } elseif ($s.dependsOn -and -not ($s.dependsOn -is [System.Array])) {
             $s.dependsOn = @($s.dependsOn)
         }
+
+        # Normalize generateArtifact flag (default true) and register in script-level lookup
+        if (-not ($s.PSObject.Properties.Name -contains 'generateArtifact')) {
+            $s | Add-Member -NotePropertyName generateArtifact -NotePropertyValue $true -Force
+        } else {
+            # coerce to boolean
+            try { $s.generateArtifact = [bool]$s.generateArtifact } catch { $s.generateArtifact = $true }
+        }
+        $script:FoxhoundStepConfig[$s.id] = $s.generateArtifact
     }
 
     # Status map: Pending, Running, Success, Failed, Skipped
@@ -286,7 +298,8 @@ function Invoke-Step {
                 $monitorArgs = @(
                     '-NoProfile','-ExecutionPolicy','Bypass',
                     '-Command',
-                    "Import-Module `"$PSScriptRoot\foxhound.psm1`"; Start-FoxhoundMonitor -Pid $($proc.Id) -OutFile `"$outFile`" -ErrFile `"$errFile`" -StepId `"$StepId`" -ProjectRoot `"$ProjectRoot`" -ManifestName `"$ManifestName`""
+                    # Pass generateArtifact flag so the detached monitor knows whether to emit artifacts
+                    "Import-Module `"$PSScriptRoot\foxhound.psm1`"; Start-FoxhoundMonitor -Pid $($proc.Id) -OutFile `"$outFile`" -ErrFile `"$errFile`" -StepId `"$StepId`" -ProjectRoot `"$ProjectRoot`" -ManifestName `"$ManifestName`" -GenerateArtifact $($([bool]$Step.generateArtifact))"
                 )
 
                 Start-Process -FilePath $psExe -ArgumentList $monitorArgs -WindowStyle Hidden -WorkingDirectory $ProjectRoot | Out-Null
@@ -391,12 +404,16 @@ function Start-FoxhoundMonitor {
         [Parameter(Mandatory=$true)][string]$ErrFile,
         [Parameter(Mandatory=$true)][string]$StepId,
         [Parameter(Mandatory=$true)][string]$ProjectRoot,
-        [Parameter(Mandatory=$true)][string]$ManifestName
+        [Parameter(Mandatory=$true)][string]$ManifestName,
+        [Parameter(Mandatory=$false)][bool]$GenerateArtifact = $true
     )
 
     # Re-establish minimal context for artifact helpers
     $script:CurrentProjectRoot  = $ProjectRoot
     $script:CurrentManifestName = $ManifestName
+    # Ensure the per-step config exists in this process and respect the passed flag
+    if (-not $script:FoxhoundStepConfig) { $script:FoxhoundStepConfig = @{} }
+    try { $script:FoxhoundStepConfig[$StepId] = [bool]$GenerateArtifact } catch {}
 
     # Hard safety cap so this monitor can never leak forever
     $maxSeconds = 1800  # 30 minutes
@@ -586,7 +603,13 @@ function Set-StepData {
     # Emit artifact for this step (if we can determine logs location)
     try {
         if ($script:CurrentProjectRoot -and $script:CurrentManifestName) {
-            Send-StepArtifact -StepId $StepId -Entry $entry -ProjectRoot $script:CurrentProjectRoot -ManifestName $script:CurrentManifestName
+            $shouldEmit = $true
+            if ($script:FoxhoundStepConfig -and $script:FoxhoundStepConfig.ContainsKey($StepId)) {
+                $shouldEmit = $script:FoxhoundStepConfig[$StepId]
+            }
+            if ($shouldEmit) {
+                Send-StepArtifact -StepId $StepId -Entry $entry -ProjectRoot $script:CurrentProjectRoot -ManifestName $script:CurrentManifestName
+            }
         }
     } catch { }
 
