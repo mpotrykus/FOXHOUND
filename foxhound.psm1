@@ -47,6 +47,15 @@ function Invoke-Manifest {
             try { $s.generateArtifact = [bool]$s.generateArtifact } catch { $s.generateArtifact = $true }
         }
         $script:FoxhoundStepConfig[$s.id] = $s.generateArtifact
+
+        # Normalize artifactPath -> artifactPaths (allow single string or array). Ensure artifactPaths is always an array.
+        if ($s.PSObject.Properties.Name -contains 'artifactPaths') {
+            if ($s.artifactPaths -and -not ($s.artifactPaths -is [System.Array])) {
+                $s.artifactPaths = @($s.artifactPaths)
+            }
+        } else {
+            $s | Add-Member -NotePropertyName artifactPaths -NotePropertyValue @() -Force
+        }
     }
 
     # Status map: Pending, Running, Success, Failed, Skipped
@@ -724,15 +733,38 @@ function New-RunArtifact {
         $entry = $null
         if ($script:FoxhoundSteps -and $script:FoxhoundSteps.ContainsKey($id)) { $entry = $script:FoxhoundSteps[$id] }
 
+        # Resolve declared artifactPaths (if any) into absolute paths; fall back to manifest artifacts/<id>.artifact.json
+        $artifactPathsResolved = @()
+        $manifestRoot = if ($ManifestName) { Join-Path $ProjectRoot $ManifestName } else { $ProjectRoot }
+        $artifactsFolder = Get-ArtifactsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName
+        if ($step.artifactPaths) {
+            $decl = if ($step.artifactPaths -is [System.Array]) { $step.artifactPaths } else { @($step.artifactPaths) }
+            foreach ($p in $decl) {
+                if (-not $p) { continue }
+                $pstr = $p.ToString()
+                if (-not [IO.Path]::IsPathRooted($pstr)) {
+                    $cand = Join-Path $manifestRoot $pstr
+                    if (-not (Test-Path $cand)) { $cand = Join-Path $artifactsFolder $pstr }
+                } else {
+                    $cand = $pstr
+                }
+                $artifactPathsResolved += $cand
+            }
+        }
+        if (-not $artifactPathsResolved -or $artifactPathsResolved.Count -eq 0) {
+            $artifactPathsResolved = @((Join-Path $artifactsFolder ("$id.artifact.json")))
+        }
+
+
         $artifactNode = [pscustomobject]@{
             Id = $id
             Name = $step.name
             Status = if ($Statuses.ContainsKey($id)) { $Statuses[$id] } else { ($entry.Status -or 'Unknown') }
             DependsOn = if ($step.dependsOn) { $step.dependsOn } else { @() }
-            ArtifactPath = if ($ProjectRoot) { (Join-Path (Get-ArtifactsFolderPath -ProjectRoot $ProjectRoot -ManifestName $ManifestName) ("$id.artifact.json")) } else { $null }
+            ArtifactPaths = $artifactPathsResolved
             Data = if ($entry) { $entry.Data } else { $null }
         }
-        $nodes += $artifactNode
+         $nodes += $artifactNode
     }
 
     $edges = @()
@@ -1050,7 +1082,6 @@ function Update-StepDataFromLogs {
     )
 
     if (-not $ProjectRoot) { return }
-    # Base manifest folder
     try {
         $manifestRoot = if ($ManifestName) { Join-Path $ProjectRoot $ManifestName } else { $ProjectRoot }
     } catch { return }
@@ -1058,11 +1089,53 @@ function Update-StepDataFromLogs {
 
     if (-not $script:FoxhoundSteps) { $script:FoxhoundSteps = @{} }
 
-    # Read .data.json files from manifest-level logs folder
-    $manifestLogs = Join-Path $manifestRoot "logs"
-    if (-not (Test-Path $manifestLogs)) { return }
+    # Try to read manifest JSON (optional) to discover per-step artifactPath entries
+    $manifestDef = $null
+    try {
+        $candidate = Get-ChildItem -Path $manifestRoot -Filter "$ManifestName*.json" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($candidate) {
+            $manifestDef = Get-Content $candidate.FullName -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+        }
+    } catch { $manifestDef = $null }
 
-    $files = Get-ChildItem -Path $manifestLogs -Filter '*.data.json' -File -ErrorAction SilentlyContinue
+    # Read .artifact.json files from manifest-level artifacts folder (no .data.json usage)
+    $manifestArtifacts = Join-Path $manifestRoot "artifacts"
+    if (-not (Test-Path $manifestArtifacts)) { return }
+
+    # Start with all artifact files in the artifacts folder
+    $files = @()
+    $files += (Get-ChildItem -Path $manifestArtifacts -Filter '*.artifact.json' -File -ErrorAction SilentlyContinue)
+
+    # If manifest declares per-step artifactPaths, include those paths (allows custom locations)
+    if ($manifestDef -and $manifestDef.steps) {
+        foreach ($s in $manifestDef.steps) {
+            # Support artifactPaths collection (or legacy artifactPath)
+            $declaredPaths = @()
+            if ($s.artifactPaths) {
+                if ($s.artifactPaths -is [System.Array]) { $declaredPaths = $s.artifactPaths } else { $declaredPaths = @($s.artifactPaths) }
+            } elseif ($s.artifactPath) {
+                $declaredPaths = @($s.artifactPath)
+            }
+            foreach ($ap in $declaredPaths) {
+                if (-not $ap) { continue }
+                $apStr = $ap.ToString()
+                if (-not [IO.Path]::IsPathRooted($apStr)) {
+                    $candidatePath = Join-Path $manifestRoot $apStr
+                    if (-not (Test-Path $candidatePath)) { $candidatePath = Join-Path $manifestArtifacts $apStr }
+                } else {
+                    $candidatePath = $apStr
+                }
+                if (Test-Path $candidatePath) {
+                    $fi = Get-Item -LiteralPath $candidatePath -ErrorAction SilentlyContinue
+                    if ($fi) { $files += $fi }
+                }
+            }
+         }
+     }
+
+    # Unique files only
+    $files = $files | Sort-Object -Property FullName -Unique
+
     if (-not $files) { return }
 
     foreach ($f in $files) {
