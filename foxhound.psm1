@@ -286,8 +286,15 @@ function Invoke-Step {
                     $startParams.FilePath     = (Get-Command cmd.exe).Source
                     $startParams.ArgumentList = @('/c', $cmdInner)
                 }
+                '.exe' {
+                    # Native executable: pass tokenized arguments directly
+                    $startParams.FilePath     = $ScriptPath
+                    if ($argArray -and $argArray.Count -gt 0) { $startParams.ArgumentList = $argArray }
+                }
                 default {
+                    # Fallback for unknown extensions (treat like executable)
                     $startParams.FilePath = $ScriptPath
+                    if ($argArray -and $argArray.Count -gt 0) { $startParams.ArgumentList = $argArray }
                 }
             }
 
