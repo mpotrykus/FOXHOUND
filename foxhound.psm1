@@ -26,8 +26,7 @@ function Invoke-Manifest {
 
     # Build step map
     # preserve manifest order for scheduling
-    $stepsById = [ordered]@{
-    }
+    $stepsById = [ordered]@{ }
     foreach ($s in $manifest.steps) {
         $stepsById[$s.id] = $s
         # Normalize dependsOn to array
@@ -47,8 +46,7 @@ function Invoke-Manifest {
     if (-not $script:FoxhoundCompleted) { $script:FoxhoundCompleted = @{} }
 
     # Active jobs mapping job.Id -> stepId
-    $activeJobs = @{
-    }
+    $activeJobs = @{ }
 
     # Main scheduling loop
     $maxIterations = ($stepsById.Keys.Count * 5) + 100
@@ -118,7 +116,6 @@ function Invoke-Manifest {
     $execJson = $ExecutionContext.Steps['check-display'].Data.Name | ConvertTo-Json -Depth 10 -ErrorAction Stop
     Write-Host $execJson
    
-
     # Final summary: log statuses
     foreach ($id in $statuses.Keys) {
         Write-StepLog $id "Final status: $($statuses[$id])" $ProjectRoot $manifestName
@@ -146,7 +143,7 @@ function Invoke-Step {
         [string]$ProjectRoot,
         [string]$ManifestName,
         [switch]$InBackgroundJob
-        )
+    )
                 
     $StepId = $Step.id
 
@@ -158,7 +155,7 @@ function Invoke-Step {
     $RetryDelayMs = if ($Step.retryDelayMs) { $Step.retryDelayMs } else { 200 }
 
     Write-StepLog $StepId "Invoked step - $StepId" $ProjectRoot $ManifestName
-    
+
     $StepArgsArray = if ($Step.args) { $Step.args } else { @() }
 
     try {
@@ -212,7 +209,7 @@ function Invoke-Step {
             $cmdInner = if ($cmdPieces.Count -gt 0) { "$scriptPathInner $($cmdPieces -join ' ')" } else { $scriptPathInner }
             $ActualCommand = "cmd.exe /c `"$cmdInner`""
         } else {
-            $ActualCommand = "Start-Job -FilePath `"$ScriptPath`""
+            $ActualCommand = "Start-Process -FilePath `"$ScriptPath`""
         }
 
         Write-Host "FOXHOUND executing $StepId ($ActualCommand)"
@@ -284,15 +281,15 @@ function Invoke-Step {
                 # record an initial entry so conditions can see that step started async
                 Set-StepData -StepId $StepId -Data $null -Output @() -ErrLines @() -Combined "" -ExitCode $proc.Id -Status 'STARTED-ASYNC' | Out-Null
 
-                # Build detached monitor script (written to temp file) so it can finish logging after foxhound exits
-                $monitorPath = Join-Path ([IO.Path]::GetTempPath()) ("foxhound-monitor-$($StepId)-$([Guid]::NewGuid().ToString()).ps1")
-                $monitorScript = New-MonitorScript
-
-                $monitorScript | Out-File -FilePath $monitorPath -Encoding UTF8 -Force
-
-                # Launch the detached monitor process (passes args as positional parameters)
+                # Launch a detached PowerShell that imports FOXHOUND and runs a real monitor function
                 $psExe = (Get-Command powershell).Source
-                Start-Process -FilePath $psExe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$monitorPath,$proc.Id,$outFile,$errFile,$StepId,$ProjectRoot,$ManifestName) -WindowStyle Hidden -WorkingDirectory $ProjectRoot | Out-Null
+                $monitorArgs = @(
+                    '-NoProfile','-ExecutionPolicy','Bypass',
+                    '-Command',
+                    "Import-Module `"$PSScriptRoot\foxhound.psm1`"; Start-FoxhoundMonitor -Pid $($proc.Id) -OutFile `"$outFile`" -ErrFile `"$errFile`" -StepId `"$StepId`" -ProjectRoot `"$ProjectRoot`" -ManifestName `"$ManifestName`""
+                )
+
+                Start-Process -FilePath $psExe -ArgumentList $monitorArgs -WindowStyle Hidden -WorkingDirectory $ProjectRoot | Out-Null
 
                 # Record started-async and return immediate success so dependents run without waiting
                 Write-Timeline $StepId "STARTED-ASYNC" $ProjectRoot $ManifestName
@@ -385,6 +382,114 @@ function Invoke-Step {
 }
 
 # ---------------------------
+# Async monitor as a real function (no string script)
+# ---------------------------
+function Start-FoxhoundMonitor {
+    param(
+        [Parameter(Mandatory=$true)][int]$Pid,
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [Parameter(Mandatory=$true)][string]$ErrFile,
+        [Parameter(Mandatory=$true)][string]$StepId,
+        [Parameter(Mandatory=$true)][string]$ProjectRoot,
+        [Parameter(Mandatory=$true)][string]$ManifestName
+    )
+
+    # Re-establish minimal context for artifact helpers
+    $script:CurrentProjectRoot  = $ProjectRoot
+    $script:CurrentManifestName = $ManifestName
+
+    # Hard safety cap so this monitor can never leak forever
+    $maxSeconds = 1800  # 30 minutes
+    $start = Get-Date
+
+    try {
+        # Wait for target process to exit or disappear
+        while ($true) {
+            $proc = $null
+            try {
+                $proc = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+            } catch {
+                $proc = $null
+            }
+
+            if (-not $proc) { break }
+
+            if ((Get-Date) - $start -gt [TimeSpan]::FromSeconds($maxSeconds)) {
+                try { $proc.Kill() } catch { }
+                break
+            }
+
+            Start-Sleep -Milliseconds 500
+        }
+
+        # Read captured output
+        $output   = @()
+        $errLines = @()
+
+        if (Test-Path $OutFile) {
+            $output = Get-Content $OutFile -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $ErrFile) {
+            $errLines = Get-Content $ErrFile -ErrorAction SilentlyContinue
+        }
+
+        # Try to get exit code if process still queryable
+        $exitCode = $null
+        try {
+            $p = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+            if ($p) { $exitCode = $p.ExitCode }
+        } catch {
+            $exitCode = $null
+        }
+
+        $combinedText = (($output + $errLines) -join "`n").ToString()
+        $errorPattern = '(?i)\b(error|exception|failed|cannot|not found|no such file|invalid|syntax is incorrect)\b'
+
+        $parsedData = ParseOutputToData -Output $output -ErrLines $errLines -CombinedText $combinedText
+
+        if ($null -ne $exitCode -and $exitCode -ne 0) {
+            $success = $false
+        } elseif ($combinedText -and ($combinedText -match $errorPattern)) {
+            $success = $false
+        } else {
+            $success = $true
+        }
+
+        $statusStr = if ($success) { 'SUCCESS' } else { 'FAIL' }
+
+        # Log lines into the step log
+        foreach ($l in $output)   { Write-StepLog $StepId $l $ProjectRoot $ManifestName }
+        foreach ($l in $errLines) { Write-StepLog $StepId $l $ProjectRoot $ManifestName }
+
+        # Store parsed data and emit artifacts
+        Set-StepData -StepId $StepId -Data $parsedData -Output $output -ErrLines $errLines -Combined $combinedText -ExitCode $exitCode -Status $statusStr | Out-Null
+
+        # Emit final timeline entry if orchestrator didn't already
+        if (-not $script:FoxhoundCompleted) { $script:FoxhoundCompleted = @{} }
+        if (-not $script:FoxhoundCompleted.ContainsKey($StepId)) {
+            Write-Timeline $StepId $statusStr $ProjectRoot $ManifestName
+            $script:FoxhoundCompleted[$StepId] = $true
+        }
+
+    } catch {
+        Write-StepLog $StepId "Monitor exception: $_" $ProjectRoot $ManifestName
+        try {
+            Set-StepData -StepId $StepId -Data $null -Output @() -ErrLines @("Monitor exception: $_") -Combined "" -ExitCode $null -Status 'FAIL' | Out-Null
+            if (-not $script:FoxhoundCompleted) { $script:FoxhoundCompleted = @{} }
+            if (-not $script:FoxhoundCompleted.ContainsKey($StepId)) {
+                Write-Timeline $StepId "FAIL" $ProjectRoot $ManifestName
+                $script:FoxhoundCompleted[$StepId] = $true
+            }
+        } catch { }
+    }
+    finally {
+        # Best-effort cleanup of temp files
+        try { if (Test-Path $OutFile) { Remove-Item $OutFile -ErrorAction SilentlyContinue } } catch { }
+        try { if (Test-Path $ErrFile) { Remove-Item $ErrFile -ErrorAction SilentlyContinue } } catch { }
+    }
+}
+
+# ---------------------------
 # Execution context / step-data helpers
 # ---------------------------
 function Initialize-FoxhoundExecutionContext {
@@ -442,8 +547,7 @@ function ParseOutputToData {
     }
 
     # Fallback: parse simple key=value lines into a hashtable
-    $ht = @{
-    }
+    $ht = @{}
     foreach ($l in $all) {
         if ($l -match '^\s*([A-Za-z0-9_]+)\s*=\s*(.+)$') {
             $ht[$Matches[1]] = $Matches[2].Trim()
@@ -468,7 +572,7 @@ function Set-StepData {
     $entry = [pscustomobject]@{
         StepId    = $StepId
         Data      = $Data
-        Output  = $Output
+        Output    = $Output
         ErrLines  = $ErrLines
         Combined  = $Combined
         ExitCode  = $ExitCode
@@ -527,8 +631,6 @@ function Get-ArtifactsFolderPath {
     return $artFolder
 }
 
-# ---------------------------
-# Artifact helpers (updated to use artifacts folder)
 function New-StepArtifactObject {
     param(
         [string]$StepId,
@@ -655,6 +757,7 @@ function Send-RunArtifact {
 
 # ---------------------------
 # Large task methods (scheduling etc.)
+# ---------------------------
 function Start-ReadySteps {
     param(
         [Parameter(Mandatory=$true)] [hashtable]$StepsById,
@@ -705,6 +808,9 @@ function Start-ReadySteps {
             Write-StepLog $id "Scheduling step. Background=$inBg" $ProjectRoot $ManifestName
             $result = Invoke-Step -Step $step -ProjectRoot $ProjectRoot -ManifestName $ManifestName -InBackgroundJob:($inBg)
 
+            # Record that we attempted to start something this iteration
+            $startedAny = $true
+
             if ($result -is [System.Management.Automation.Job]) {
                 $job = $result
                 $ActiveJobs[$job.Id] = $id
@@ -718,120 +824,11 @@ function Start-ReadySteps {
                     $Statuses[$id] = 'Failed'
                     $script:FoxhoundCompleted[$id] = $true
                 }
-            } else {
-                # Unknown return - mark failed
-                $Statuses[$id] = 'Failed'
-                $script:FoxhoundCompleted[$id] = $true
             }
-
-            $startedAny = $true
         }
     }
+
     return $startedAny
-}
-
-# Helper methods (after large tasks)
-
-# ---------------------------
-# Helper: Build monitor script
-# ---------------------------
-function New-MonitorScript {
-    # returns the content of the detached monitor script (literal, no interpolation)
-    return @'
-param($processId,$outFile,$errFile,$StepId,$ProjectRoot,$ManifestName)
-
-# Manifest root and manifest-level logs folder:
-$manifestRoot = if ($ManifestName) { Join-Path $ProjectRoot $ManifestName } else { $ProjectRoot }
-$logsFolder = Join-Path $manifestRoot "logs"
-if (-not (Test-Path $logsFolder)) { New-Item -ItemType Directory -Path $logsFolder -Force | Out-Null }
-$artifactsFolder = Join-Path $manifestRoot "artifacts"
-if (-not (Test-Path $artifactsFolder)) { New-Item -ItemType Directory -Path $artifactsFolder -Force | Out-Null }
-
-$stepLog = Join-Path $logsFolder ("$StepId.log")
-# Run-level timeline at manifest root
-$timeline = Join-Path $logsFolder "timeline.log"
-
-$p = $null
-try {
-    $p = [System.Diagnostics.Process]::GetProcessById([int]$processId)
-    $p.WaitForExit()
-} catch { }
-
-$output = @()
-$errLines = @()
-foreach ($f in @($outFile, $errFile)) {
-    if (Test-Path $f) {
-        try {
-            $lines = Get-Content $f -ErrorAction SilentlyContinue
-            foreach ($l in $lines) {
-                $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
-                "$ts | $l" | Out-File -FilePath $stepLog -Append -Encoding UTF8
-            }
-            if ($f -eq $outFile) { $output = $lines }
-            if ($f -eq $errFile) { $errLines = $lines }
-        } catch { }
-        Remove-Item $f -ErrorAction SilentlyContinue
-    }
-}
-
-$exitCode = $null
-try { if ($p) { $exitCode = $p.ExitCode } } catch { $exitCode = $null }
-
-$combinedText = (($output + $errLines) -join "`n").ToString()
-$errorPattern = '(?i)\b(error|exception|failed|cannot|not found|no such file|invalid|syntax is incorrect)\b'
-
-$status = ''
-if ($null -ne $exitCode -and $exitCode -ne 0) {
-    "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')) | $StepId | Process exited with code $exitCode" | Out-File -FilePath $timeline -Append -Encoding UTF8
-    $status = 'FAIL'
-} elseif ($combinedText -and ($combinedText -match $errorPattern)) {
-    "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')) | $StepId | Detected error-like text in output; treating step as failed." | Out-File -FilePath $timeline -Append -Encoding UTF8
-    $status = 'FAIL'
-} else {
-    "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')) | $StepId | SUCCESS" | Out-File -FilePath $timeline -Append -Encoding UTF8
-    $status = 'SUCCESS'
-}
-
-# Attempt to parse structured data from output (prefer explicit marker)
-$data = $null
-foreach ($l in ($output + $errLines)) {
-    if ($l -match '^\s*FOXHOUND:DATA\s+(.*)$') {
-        $json = $Matches[1].Trim()
-        try { $data = $json | ConvertFrom-Json -ErrorAction Stop; break } catch { $data = $null }
-    }
-}
-if (-not $data) {
-    foreach ($l in ($output + $errLines)) {
-        $t = $l.Trim()
-        if ($t.StartsWith('{') -and $t.EndsWith('}')) {
-            try { $data = $t | ConvertFrom-Json -ErrorAction Stop; break } catch { $data = $null }
-        }
-    }
-}
-
-# Build artifact object and write manifest-level artifact file (do NOT write .data.json)
-$artifact = [pscustomobject]@{
-    StepId       = $StepId
-    Status       = $status
-    ExitCode     = $exitCode
-    Data         = $data
-    Output       = if ($output) { $output } else { @() }
-    ErrLines     = $errLines
-    Combined     = $combinedText
-    DurationMs   = $null
-    StartTime    = $null
-    LogPath      = (Join-Path $logsFolder ("$StepId.log"))
-    DataPath     = (Join-Path $logsFolder ("$StepId.data.json"))  # path retained for compatibility but not written
-    ArtifactPath = (Join-Path $artifactsFolder ("$StepId.artifact.json"))
-    Timestamp    = (Get-Date).ToString("o")
-}
-
-$artifactFile = $artifact.ArtifactPath
-try { $artifact | ConvertTo-Json -Depth 10 | Out-File -FilePath $artifactFile -Encoding UTF8 -Force } catch {}
-
-# attempt to remove ourself
-try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue } catch {}
-'@
 }
 
 # Helper methods (logging, etc.)
